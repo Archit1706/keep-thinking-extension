@@ -9,47 +9,58 @@ class AILoadingDetector {
   private isLoading = false;
   private loadingStartTime: number | null = null;
   private puzzleTriggered = false;
-  private minTriggerDelay = 2500; // Don't trigger for quick responses
+  private minTriggerDelay = 1500; // Don't trigger for quick responses (reduced for better responsiveness)
   private animationFrameId: number | null = null;
+  private lastCheckTime = 0;
+  private checkInterval = 250; // Check every 250ms instead of every frame
 
   private selectors: Record<Platform, PlatformSelectors> = {
     chatgpt: {
       stopButton: [
         'button[aria-label="Stop generating"]',
+        'button[aria-label*="Stop"]',
         'button[data-testid="stop-button"]',
         'button[data-testid="fruitjuice-stop-button"]',
+        'button:has(svg):not([disabled])', // Stop button usually has an SVG icon
       ],
       streamingClass: 'result-streaming',
       responseContainer: 'div[data-message-author-role="assistant"]',
+      sendButtonDisabled: 'button[data-testid="send-button"]:disabled, button[data-testid="fruitjuice-send-button"]:disabled',
     },
     claude: {
       stopButton: [
-        'button[aria-label*="Stop"]',
-        'button[aria-label*="Cancel"]',
-        'button[title*="Stop"]',
+        'button[aria-label*="Stop" i]',
+        'button[aria-label*="Cancel" i]',
+        'button[title*="Stop" i]',
+        'button.stop-button',
       ],
-      sendButtonDisabled: 'button[type="submit"]:disabled',
-      loadingIndicator: ['[class*="loading"]', '[class*="thinking"]'],
+      sendButtonDisabled: 'button[type="submit"]:disabled, form button[disabled]',
+      loadingIndicator: ['[class*="loading" i]', '[class*="thinking" i]', '[class*="generating" i]'],
     },
     gemini: {
       loadingIndicator: [
         '.loading-line',
-        '[class*="animate-loading"]',
-        '[class*="response-loading"]',
+        '[class*="animate-loading" i]',
+        '[class*="response-loading" i]',
+        '[class*="generating" i]',
       ],
-      stopButton: ['button[aria-label*="Stop"]'],
+      stopButton: ['button[aria-label*="Stop" i]'],
+      sendButtonDisabled: 'button[disabled]',
     },
     deepseek: {
-      stopButton: ['button[aria-label*="Stop"]', 'button[title*="Stop"]'],
+      stopButton: ['button[aria-label*="Stop" i]', 'button[title*="Stop" i]'],
       streamingClass: 'streaming',
+      sendButtonDisabled: 'button[type="submit"]:disabled',
     },
     perplexity: {
-      stopButton: ['button[aria-label*="Stop"]'],
-      loadingIndicator: ['[class*="loading"]', '[class*="searching"]'],
+      stopButton: ['button[aria-label*="Stop" i]'],
+      loadingIndicator: ['[class*="loading" i]', '[class*="searching" i]'],
+      sendButtonDisabled: 'button[disabled]',
     },
     generic: {
-      stopButton: ['button[aria-label*="Stop"]'],
-      loadingIndicator: ['[class*="loading"]'],
+      stopButton: ['button[aria-label*="Stop" i]'],
+      loadingIndicator: ['[class*="loading" i]'],
+      sendButtonDisabled: 'button:disabled',
     },
   };
 
@@ -86,22 +97,61 @@ class AILoadingDetector {
     // Extended thinking mode detection
     const extendedThinking = this.isExtendedThinkingMode();
 
-    return !!(stopBtn || streaming || loading || sendDisabled || extendedThinking);
+    const isLoading = !!(stopBtn || streaming || loading || sendDisabled || extendedThinking);
+
+    // Debug logging (only log state changes to avoid spam)
+    if (isLoading !== this.isLoading) {
+      console.log('[BrainWait] Detection state change:', {
+        platform: this.platform,
+        stopBtn: !!stopBtn,
+        streaming: !!streaming,
+        loading: !!loading,
+        sendDisabled: !!sendDisabled,
+        extendedThinking: !!extendedThinking,
+        result: isLoading,
+      });
+    }
+
+    return isLoading;
   }
 
   private isExtendedThinkingMode(): boolean {
+    // Check for elements with thinking-related classes or attributes
     const thinkingIndicators = [
-      '[class*="thinking"]',
-      '[aria-label*="Thinking"]',
+      '[class*="thinking" i]',
+      '[aria-label*="Thinking" i]',
       '[data-extended="true"]',
-      'text()',
     ];
-    return thinkingIndicators.some((s) => {
-      const elements = document.querySelectorAll(s);
-      return Array.from(elements).some((el) =>
-        el.textContent?.toLowerCase().includes('thinking')
-      );
-    });
+
+    for (const selector of thinkingIndicators) {
+      try {
+        const elements = document.querySelectorAll(selector);
+        if (elements.length > 0) {
+          return true;
+        }
+      } catch (e) {
+        // Ignore selector errors
+      }
+    }
+
+    // Also check for visible text containing "thinking"
+    const body = document.body;
+    if (body && body.textContent?.toLowerCase().includes('thinking')) {
+      // Make sure it's in a visible element
+      const allElements = document.querySelectorAll('div, span, p');
+      for (const el of Array.from(allElements)) {
+        const text = el.textContent?.toLowerCase() || '';
+        if (text.includes('thinking') && text.length < 100) {
+          // Short text containing "thinking" is likely a status indicator
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
   }
 
   private sendMessage(message: ExtensionMessage): void {
@@ -111,7 +161,18 @@ class AILoadingDetector {
   }
 
   start(callbacks?: DetectorCallbacks): void {
+    console.log('[BrainWait] Starting detector for platform:', this.platform);
+
     const check = () => {
+      const now = Date.now();
+
+      // Throttle checks to reduce CPU usage
+      if (now - this.lastCheckTime < this.checkInterval) {
+        this.animationFrameId = requestAnimationFrame(check);
+        return;
+      }
+      this.lastCheckTime = now;
+
       const nowLoading = this.checkLoadingState();
 
       if (nowLoading && !this.isLoading) {
@@ -120,7 +181,7 @@ class AILoadingDetector {
         this.loadingStartTime = Date.now();
         this.puzzleTriggered = false;
 
-        console.log('[BrainWait] Loading started');
+        console.log('[BrainWait] 🚀 AI started generating response!');
         this.sendMessage({ type: 'LOADING_STARTED' });
         callbacks?.onStart?.();
       } else if (!nowLoading && this.isLoading) {
@@ -128,7 +189,7 @@ class AILoadingDetector {
         const duration = Date.now() - (this.loadingStartTime || 0);
         this.isLoading = false;
 
-        console.log('[BrainWait] Loading completed, duration:', duration);
+        console.log('[BrainWait] ✅ AI finished responding, duration:', duration, 'ms');
         this.sendMessage({ type: 'LOADING_COMPLETE', payload: { duration } });
         callbacks?.onComplete?.(duration);
       } else if (nowLoading && !this.puzzleTriggered) {
@@ -137,7 +198,7 @@ class AILoadingDetector {
         if (elapsed >= this.minTriggerDelay) {
           this.puzzleTriggered = true;
 
-          console.log('[BrainWait] Triggering puzzle after', elapsed, 'ms');
+          console.log('[BrainWait] 🧩 Triggering puzzle after', elapsed, 'ms');
           this.sendMessage({ type: 'TRIGGER_PUZZLE' });
           callbacks?.onTriggerPuzzle?.();
         }
@@ -159,12 +220,31 @@ class AILoadingDetector {
 
   updateMinTriggerDelay(delay: number): void {
     this.minTriggerDelay = delay;
+    console.log('[BrainWait] Updated trigger delay to:', delay, 'ms');
+  }
+
+  // Debug method to manually test detection
+  testDetection(): boolean {
+    const state = this.checkLoadingState();
+    console.log('[BrainWait] Manual detection test:', {
+      platform: this.platform,
+      isLoading: state,
+      currentlyTracking: this.isLoading,
+    });
+    return state;
   }
 }
 
 // Initialize detector when script loads
+console.log('[BrainWait] 🧩 Content script loaded!');
+console.log('[BrainWait] URL:', window.location.href);
+
 const detector = new AILoadingDetector();
 detector.start();
+
+// Expose detector to window for debugging
+(window as any).brainwaitDetector = detector;
+console.log('[BrainWait] 💡 Debug tip: Run window.brainwaitDetector.testDetection() to test detection');
 
 // Handle visibility changes - pause when tab is hidden to save battery
 document.addEventListener('visibilitychange', () => {
